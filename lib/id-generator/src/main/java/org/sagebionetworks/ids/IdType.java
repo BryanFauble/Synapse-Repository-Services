@@ -4,7 +4,7 @@ package org.sagebionetworks.ids;
  * Enumeration that defines the ID sequence for each type of object.
  */
 public enum IdType {
-	
+
 	ACCESS_APPROVAL_ID(9602619L),
 	ACCESS_REQUIREMENT_ID(9602619L),
 	ACTIVITY_ID(9602619L),
@@ -23,7 +23,7 @@ public enum IdType {
 	CHANGE_ID(null),
 	FAVORITE_ID(null),
 	ACL_RES_ACC_ID(null),
-	COLUMN_MODEL_ID(null), 
+	COLUMN_MODEL_ID(null),
 	MESSAGE_ID(null),
 	PRINCIPAL_ID(null),
 	PRINCIPAL_ALIAS_ID(null),
@@ -92,12 +92,12 @@ public enum IdType {
 	REALM_PRINCIPAL(2000L),
 	TEXT_ANALYZER_ID(1000L)
 	;
-	
+
 	Long startingId;
-	
+
 	/**
-	 * 
-	 * @param startingId The ID that the sequence for this type will start from. 
+	 *
+	 * @param startingId The ID that the sequence for this type will start from.
 	 * If null the sequence will start from one.
 	 */
 	IdType(Long startingId){
@@ -107,12 +107,10 @@ public enum IdType {
 	/**
 	 * The ID that the sequence for this type will start from. If null the
 	 * sequence will start from one.
-	 * 
+	 *
 	 * @return
 	 */
 	public Long getStartingId() {
 		return startingId;
 	}
-	
-	
-}
+
