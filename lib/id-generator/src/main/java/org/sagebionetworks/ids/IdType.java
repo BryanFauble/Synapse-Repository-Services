@@ -61,7 +61,7 @@ public enum IdType {
 	QUARANTINED_EMAIL_ID(null),
 	// Note that this is used for both views and tables
 	VIEW_SNAPSHOT_ID(null),
-	ORGANIZATION_ID(null),
+	ORGANIZATION_ID(10L),
 	JSON_SCHEMA_ID(null),
 	JSON_SCHEMA_BLOB_ID(null),
 	JSON_SCHEMA_VERSION_ID(null),
