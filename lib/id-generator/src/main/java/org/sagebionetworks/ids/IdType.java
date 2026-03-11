@@ -90,17 +90,16 @@ public enum IdType {
 	RECORDSET_VALIDATION_STATS_ID(null),
 	REALM(1L),
 	REALM_PRINCIPAL(2000L),
-	TEXT_ANALYZER_ID(1000L)
-	;
+	TEXT_ANALYZER_ID(1000L);
 
 	Long startingId;
 
 	/**
 	 *
 	 * @param startingId The ID that the sequence for this type will start from.
-	 * If null the sequence will start from one.
+	 *                   If null the sequence will start from one.
 	 */
-	IdType(Long startingId){
+	IdType(Long startingId) {
 		this.startingId = startingId;
 	}
 
@@ -114,3 +113,4 @@ public enum IdType {
 		return startingId;
 	}
 
+}
