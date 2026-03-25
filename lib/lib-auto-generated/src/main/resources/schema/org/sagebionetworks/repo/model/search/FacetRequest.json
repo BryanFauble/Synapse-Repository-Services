@@ -1,0 +1,21 @@
+{
+	"description": "A request to aggregate a column as a facet in search results.",
+	"properties": {
+		"columnName": {
+			"type": "string",
+			"description": "The name of the column to aggregate."
+		},
+		"maxValueCount": {
+			"type": "integer",
+			"description": "Maximum number of facet values to return. Default: 25."
+		},
+		"sortField": {
+			"type": "string",
+			"description": "The field to sort facet values by. Maps to OpenSearch terms aggregation order keys: '_count' (bucket document count), '_key' (bucket key), or any sub-aggregation name. Default: '_count'."
+		},
+		"sortDirection": {
+			"description": "The direction to sort facet values. Default: DESC.",
+			"$ref": "org.sagebionetworks.repo.model.search.SortDirection"
+		}
+	}
+}
