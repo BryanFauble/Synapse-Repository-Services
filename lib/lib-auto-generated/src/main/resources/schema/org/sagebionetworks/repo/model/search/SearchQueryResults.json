@@ -24,7 +24,7 @@
 				"$ref": "org.sagebionetworks.repo.model.table.FacetColumnResult"
 			}
 		},
-		"from": {
+		"offset": {
 			"type": "integer",
 			"description": "The offset used for this page of results."
 		}
