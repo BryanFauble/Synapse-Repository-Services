@@ -141,7 +141,7 @@ jobs:
 
   invoke_workflow:
     needs: build_and_test
-    uses: Sage-Bionetworks/Synapse-Code-Pipeline/.github/workflows/execute_code_pipeline.yml@main
+    uses: BryanFauble/Synapse-Code-Pipeline/.github/workflows/execute_code_pipeline.yml@plfm-9581-mask-github-app-credentials
     with:
       CODE_PIPELINE_CF_TEMPLATE: configuration/build/codepipeline_cf_template.yaml
       PIPELINE_NAME: Synapse-Build-${{ needs.build_and_test.outputs.USER }}
