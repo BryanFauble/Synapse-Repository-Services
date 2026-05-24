@@ -1,0 +1,40 @@
+{
+	"description": "<p>A synchronous natural-language query against a single SearchIndex. The synchronous shape (distinct from the async SearchIndexQuery used for structured lexical queries) is intentional: this request type exists to be called from the Bedrock agent's return-control loop and from low-latency UI affordances, both of which need a single round-trip from query text to ranked hits without polling.</p><p>For SEMANTIC and HYBRID modes, the manager translates <code>queryText</code> into one <code>match</code> sub-query per semantic-enriched column on the target SearchIndex (per the resolved SearchConfiguration's <code>columnSemanticEnrichment</code> list) &mdash; AOSS rewrites each such <code>match</code> into a neural sparse query under the hood. For HYBRID the lexical and semantic sub-queries are combined through OpenSearch's <code>hybrid</code> compound query with a normalization processor; the available normalization / combination techniques are constrained to the AOSS-documented values.</p><p><b>ACL scoping.</b> The query is executed as the caller. Rows referencing entities the caller cannot READ are filtered out before being returned, matching the access-control behavior of SearchIndexQuery.</p>",
+	"properties": {
+		"searchIndexId": {
+			"type": "string",
+			"description": "Required. The Synapse ID of the SearchIndex entity to query. The caller must have READ access to this entity."
+		},
+		"queryText": {
+			"type": "string",
+			"description": "Required. The natural-language query. For SEMANTIC and HYBRID modes this string becomes the value of every <code>match</code> sub-query; AOSS handles the neural rewrite. For KEYWORD mode it is fed verbatim to a standard analyzed <code>match</code> query."
+		},
+		"mode": {
+			"$ref": "org.sagebionetworks.repo.model.search.table.SemanticSearchMode",
+			"description": "Required. Which retrieval strategy to use. SEMANTIC and HYBRID require at least one semantic-enriched column on the target SearchIndex; if none exists the request is downgraded to KEYWORD and the downgrade is reflected on SemanticSearchResponse.mode."
+		},
+		"topK": {
+			"type": "integer",
+			"description": "Optional. Maximum number of hits to return. Defaults to 10. Capped at 100 to keep latency and AOSS OCU spend bounded; callers needing larger result windows should fall back to SearchIndexQuery."
+		},
+		"columnFilter": {
+			"type": "array",
+			"description": "Optional. Restricts SEMANTIC and HYBRID retrieval to a subset of the semantic-enriched columns on the target SearchIndex. Each entry is a column name; columns named here but not enriched on the target SearchIndex are silently dropped. Omit to query every enriched column on the index.",
+			"items": {
+				"type": "string"
+			}
+		},
+		"hybridNormalization": {
+			"type": "string",
+			"description": "Optional. Normalization technique used when mode is HYBRID. Allowed values per the AOSS docs: <code>min_max</code>, <code>l2</code>. Defaults to <code>min_max</code>. Ignored when mode is KEYWORD or SEMANTIC."
+		},
+		"hybridCombination": {
+			"type": "string",
+			"description": "Optional. Combination technique used when mode is HYBRID. Allowed values per the AOSS docs: <code>arithmetic_mean</code>, <code>geometric_mean</code>, <code>harmonic_mean</code>. Defaults to <code>arithmetic_mean</code>. Ignored when mode is KEYWORD or SEMANTIC."
+		},
+		"hybridLexicalWeight": {
+			"type": "number",
+			"description": "Optional. The weight assigned to the BM25 lexical sub-query when mode is HYBRID. The semantic sub-queries each receive (1 - hybridLexicalWeight) / N where N is the number of enriched columns under retrieval. Defaults to 0.3. Must be in the [0.0, 1.0] range. Ignored when mode is KEYWORD or SEMANTIC."
+		}
+	}
+}
