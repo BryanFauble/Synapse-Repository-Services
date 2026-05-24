@@ -1,6 +1,7 @@
 package org.sagebionetworks.repo.manager.search;
 
 import java.io.IOException;
+import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -14,7 +15,11 @@ import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import jakarta.json.stream.JsonParser;
+
 import org.opensearch.client.json.JsonData;
+import org.opensearch.client.json.JsonpMapper;
+import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch._types.ErrorCause;
 import org.opensearch.client.opensearch._types.FieldSort;
@@ -624,6 +629,21 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 					&& analyzerDeclaresDefaultSearch(resolvedAnalyzers, effectiveQname);
 
 			m.properties(columnId, buildProperty(columnType, effectiveQname, hasDefaultSearch));
+
+			// Emit a field alias from the user-facing column name to the column-id field so
+			// callers can reference columns by name — notably the opaque query DSL, where the
+			// server does not rewrite field references. AOSS resolves the alias to the
+			// underlying field at query time (and a `match` against the alias still hits the
+			// underlying field, so semantic_enrichment rewriting is unaffected). Column names
+			// are unique within a SearchIndex schema and are assumed to be valid OpenSearch
+			// field-name characters. Skip the degenerate self-alias and the reserved system
+			// fields.
+			String columnName = column.getName();
+			if (columnName != null && !columnName.equals(columnId)
+					&& !SYSTEM_FIELD_ROW_ID.equals(columnName)
+					&& !SYSTEM_FIELD_ROW_VERSION.equals(columnName)) {
+				m.properties(columnName, p -> p.alias(alias -> alias.path(columnId)));
+			}
 		}
 	}
 
@@ -1219,7 +1239,15 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 		BoolQuery.Builder boolBuilder = new BoolQuery.Builder();
 
-		Query mainQuery = buildMainQuery(finalQueryType, finalQueryText, resolvedQueryFields, fuzziness);
+		// An opaque caller-supplied query-DSL subtree takes precedence over the structured
+		// queryType/queryText/queryFields triple. It is allowlist-validated and deserialized
+		// into a typed Query; the server still AND-s its own filter context (structured
+		// filters below) around it, and the index / paging / facets stay server-controlled.
+		// Field references in the DSL use column NAMES, resolved by the per-column field
+		// aliases emitted at index-build time — so no name->id rewrite is needed here.
+		Query mainQuery = query.getQuery() != null
+				? buildOpaqueQuery(query.getQuery())
+				: buildMainQuery(finalQueryType, finalQueryText, resolvedQueryFields, fuzziness);
 		boolBuilder.must(mainQuery);
 
 		addFilters(boolBuilder, query, columnMap, nameToId);
@@ -1297,6 +1325,26 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 					+ " (" + describeError(e.error()) + ")", e);
 		} catch (IOException e) {
 			throw new RuntimeException("Failed to execute search on search index: " + indexName, e);
+		}
+	}
+
+	// Deserializes the allowlisted caller DSL into a typed Query. A standalone JacksonJsonpMapper
+	// (no transport) is sufficient for query deserialization — same pattern SearchOpaqueJsonUtil
+	// uses for analyzer settings.
+	private static final JsonpMapper QUERY_JSONP_MAPPER = new JacksonJsonpMapper();
+
+	/**
+	 * Convert a caller-supplied opaque query-DSL object into a typed {@link Query}: normalize
+	 * the various JSON shapes to a {@link JsonNode}, enforce the clause allowlist (rejecting
+	 * scripts, cross-index reach, and validation-bypass clauses with HTTP 400), then
+	 * deserialize the cleared subtree through the OpenSearch typed {@code Query} deserializer.
+	 */
+	Query buildOpaqueQuery(Object opaqueQueryDsl) {
+		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueQueryDsl);
+		SearchQueryDslAllowlist.validate(dsl);
+		try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
+				.createParser(new StringReader(dsl.toString()))) {
+			return Query._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER);
 		}
 	}
 

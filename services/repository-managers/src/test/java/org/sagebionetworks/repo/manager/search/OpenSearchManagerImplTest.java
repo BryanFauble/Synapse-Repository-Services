@@ -1336,6 +1336,49 @@ public class OpenSearchManagerImplTest {
 				"Ineligible enrichment entries must be silently dropped: " + appliedJson.get());
 	}
 
+	@Test
+	public void testCreateIndexEmitsColumnNameAliases() throws IOException {
+		// Every column is exposed as an OpenSearch field alias of its user-facing name pointing
+		// at the column-id field, so the opaque query DSL can reference columns by name.
+		String indexName = "search-index-syn1";
+		String qname = "org.sagebionetworks-SCIENTIFIC";
+		Map<String, IndexSettingsAnalysis> resolvedAnalyzers = Collections.singletonMap(qname,
+				toAnalysis("{\"analyzer\":{\"default\":{\"type\":\"custom\",\"tokenizer\":\"standard\"}}}"));
+		List<ColumnModel> columns = Collections.singletonList(
+				new ColumnModel().setId("100").setName("abstract").setColumnType(ColumnType.LARGETEXT));
+
+		when(openSearchClient.indices()).thenReturn(indicesClient);
+		when(indicesClient.create(any(CreateIndexRequest.class))).thenReturn(
+				org.opensearch.client.opensearch.indices.CreateIndexResponse.of(b -> b
+						.acknowledged(true).shardsAcknowledged(true).index(indexName)));
+
+		// call under test
+		Optional<String> appliedJson = manager.createIndex(indexName, columns, qname,
+				Collections.emptyList(), resolvedAnalyzers, null);
+
+		com.fasterxml.jackson.databind.JsonNode properties = new com.fasterxml.jackson.databind.ObjectMapper()
+				.readTree(appliedJson.orElseThrow()).path("mappings").path("properties");
+		// The concrete field is keyed by column id "100"; the alias "abstract" -> path "100".
+		assertEquals("text", properties.path("100").path("type").asText());
+		assertEquals("alias", properties.path("abstract").path("type").asText());
+		assertEquals("100", properties.path("abstract").path("path").asText());
+	}
+
+	@Test
+	public void testBuildOpaqueQueryWithAllowedDsl() {
+		// call under test
+		org.opensearch.client.opensearch._types.query_dsl.Query q =
+				manager.buildOpaqueQuery("{\"match\":{\"abstract\":\"amyloid\"}}");
+		assertTrue(q.isMatch(), "allowed match DSL should deserialize to a typed match query");
+	}
+
+	@Test
+	public void testBuildOpaqueQueryWithDisallowedDslRejected() {
+		// script is not allowlisted — must be rejected before reaching OpenSearch. call under test
+		assertThrows(IllegalArgumentException.class,
+				() -> manager.buildOpaqueQuery("{\"script\":{\"script\":\"doc['x'].value\"}}"));
+	}
+
 	private static BulkResponseItem okItem(String id) {
 		return BulkResponseItem.of(b -> b
 				.index("search-index-syn1")
