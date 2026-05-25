@@ -1857,7 +1857,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.TOTAL_HITS), null, false);
+				EnumSet.of(SearchQueryPart.TOTAL_HITS), null, false, null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1876,7 +1876,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.HITS), null, false);
+				EnumSet.of(SearchQueryPart.HITS), null, false, null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1884,6 +1884,39 @@ public class OpenSearchManagerImplTest {
 		assertNotNull(trackHits, "trackTotalHits must be explicitly disabled");
 		assertTrue(trackHits.isEnabled(), "must use enabled() variant");
 		assertEquals(Boolean.FALSE, trackHits.enabled());
+	}
+
+	@Test
+	public void testCallSearchApiWithCollapseFieldSetsCollapse() throws IOException {
+		when(openSearchClient.search(argThat((SearchRequest req) -> req != null), eq(Map.class)))
+				.thenReturn(emptySearchResponse());
+
+		// call under test
+		manager.callSearchApi("my-index", new BoolQuery.Builder(),
+				0, 10, Collections.emptyMap(), null, null,
+				Collections.emptyList(), Collections.emptyMap(),
+				EnumSet.of(SearchQueryPart.HITS), null, false, "100");
+
+		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
+		verify(openSearchClient).search(captor.capture(), eq(Map.class));
+		assertNotNull(captor.getValue().collapse(), "collapse must be set when a collapse field is supplied");
+		assertEquals("100", captor.getValue().collapse().field());
+	}
+
+	@Test
+	public void testCallSearchApiWithoutCollapseFieldLeavesCollapseNull() throws IOException {
+		when(openSearchClient.search(argThat((SearchRequest req) -> req != null), eq(Map.class)))
+				.thenReturn(emptySearchResponse());
+
+		// call under test
+		manager.callSearchApi("my-index", new BoolQuery.Builder(),
+				0, 10, Collections.emptyMap(), null, null,
+				Collections.emptyList(), Collections.emptyMap(),
+				EnumSet.of(SearchQueryPart.HITS), null, false, null);
+
+		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
+		verify(openSearchClient).search(captor.capture(), eq(Map.class));
+		assertNull(captor.getValue().collapse(), "collapse must be unset when no collapse field is supplied");
 	}
 
 	@Test

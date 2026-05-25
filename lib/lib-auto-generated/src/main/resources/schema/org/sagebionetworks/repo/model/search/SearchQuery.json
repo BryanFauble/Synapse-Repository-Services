@@ -89,6 +89,10 @@
 			"type": "integer",
 			"description": "Maximum number of hits to return per page. Default: 25. Maximum: 100 (larger values are silently capped). Set to 0 in combination with FACETS-only response parts to retrieve only aggregate counts."
 		},
+		"collapse": {
+			"type": "string",
+			"description": "Optional. The name of a column to collapse (deduplicate) results on — only the single top-scoring hit per distinct value of this column is returned (e.g. one row per study). The column must be a keyword / numeric / date / boolean type that carries doc values; collapsing on an analyzed text column is rejected by OpenSearch. Applied only when hits are requested. totalHits still reflects the pre-collapse match count."
+		},
 		"searchAfter": {
 			"type": "string",
 			"description": "<p>Optional. Cursor for deep, stable pagination past the offset window (OpenSearch caps offset+limit at ~10,000). To page forward, echo the <code>nextSearchAfter</code> value from the previous response verbatim — it is an opaque token; do not construct or parse it. When set, <code>offset</code> is ignored (the cursor defines the position) and the server appends a row-id tiebreaker to your <code>sort</code> so the ordering is total and deterministic. Omit on the first page; a null <code>nextSearchAfter</code> in the response means there are no more pages.</p>"

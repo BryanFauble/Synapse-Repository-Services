@@ -1295,12 +1295,20 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		// `from` is forced to 0 (OpenSearch rejects from + search_after together).
 		List<FieldValue> searchAfter = parseSearchAfterCursor(query.getSearchAfter());
 
+		// Field collapse (dedup): resolve the column name to its index field id; OpenSearch
+		// enforces the keyword/numeric requirement at query time.
+		String collapseField = null;
+		if (options.contains(SearchQueryPart.HITS) && query.getCollapse() != null
+				&& !query.getCollapse().trim().isEmpty()) {
+			collapseField = nameToId.getOrDefault(query.getCollapse(), query.getCollapse());
+		}
+
 		Map<String, String> idToName = columns.stream()
 				.collect(Collectors.toMap(ColumnModel::getId, ColumnModel::getName, (a2, b) -> a2));
 
 		return callSearchApi(indexName, boolBuilder, offset, limit, aggregations,
 				highlightFields, returnFields, sortOptions, idToName, options,
-				searchAfter, opaqueAggregations);
+				searchAfter, opaqueAggregations, collapseField);
 	}
 
 	@SuppressWarnings("rawtypes")
@@ -1308,7 +1316,8 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			int offset, int limit, Map<String, Aggregation> aggregations,
 			Map<String, HighlightField> highlightFields, List<String> returnFields,
 			List<SortOptions> sortOptions, Map<String, String> idToName,
-			Set<SearchQueryPart> options, List<FieldValue> searchAfter, boolean opaqueAggregations) {
+			Set<SearchQueryPart> options, List<FieldValue> searchAfter, boolean opaqueAggregations,
+			String collapseField) {
 		boolean returnHits = options.contains(SearchQueryPart.HITS);
 		boolean returnTotalHits = options.contains(SearchQueryPart.TOTAL_HITS);
 		boolean usingCursor = searchAfter != null && !searchAfter.isEmpty();
@@ -1344,6 +1353,9 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 					}
 					if (usingCursor) {
 						req.searchAfter(searchAfter);
+					}
+					if (collapseField != null) {
+						req.collapse(c -> c.field(collapseField));
 					}
 				}
 
