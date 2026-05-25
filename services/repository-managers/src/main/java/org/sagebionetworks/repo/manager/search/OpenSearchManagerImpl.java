@@ -2,10 +2,12 @@ package org.sagebionetworks.repo.manager.search;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +17,7 @@ import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import jakarta.json.stream.JsonGenerator;
 import jakarta.json.stream.JsonParser;
 
 import org.opensearch.client.json.JsonData;
@@ -91,6 +94,7 @@ import org.springframework.stereotype.Service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /**
@@ -1252,10 +1256,18 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 		addFilters(boolBuilder, query, columnMap, nameToId);
 
-		// Skip aggregation construction entirely when the caller didn't ask for FACETS.
-		Map<String, Aggregation> aggregations = options.contains(SearchQueryPart.FACETS)
-				? buildAggregations(query.getFacetRequests(), columnMap, nameToId)
-				: Collections.emptyMap();
+		// Skip aggregation construction entirely when the caller didn't ask for FACETS. An
+		// opaque, allowlisted `aggregations` object takes precedence over the terms-only
+		// facetRequests; when used, the raw results come back on SearchQueryResults.aggregationResults.
+		boolean opaqueAggregations = query.getAggregations() != null;
+		Map<String, Aggregation> aggregations;
+		if (options.contains(SearchQueryPart.FACETS)) {
+			aggregations = opaqueAggregations
+					? buildOpaqueAggregations(query.getAggregations())
+					: buildAggregations(query.getFacetRequests(), columnMap, nameToId);
+		} else {
+			aggregations = Collections.emptyMap();
+		}
 
 		Map<String, HighlightField> highlightFields = null;
 		if (options.contains(SearchQueryPart.HITS) && Boolean.TRUE.equals(query.getHighlight())) {
@@ -1264,15 +1276,28 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 		List<String> returnFields = query.getReturnFields();
 
-		List<SortOptions> sortOptions = options.contains(SearchQueryPart.HITS)
-				? buildSortOptions(query.getSort(), columnMap, nameToId)
-				: Collections.emptyList();
+		// Sort drives both ordering and the search_after cursor. When hits are requested we
+		// always append a row-id tiebreaker so the ordering is total and deterministic — this
+		// is what makes the emitted nextSearchAfter cursor stable and round-trippable across
+		// pages, and it harmlessly breaks score/value ties for plain offset paging too.
+		List<SortOptions> sortOptions;
+		if (options.contains(SearchQueryPart.HITS)) {
+			sortOptions = new ArrayList<>(buildSortOptions(query.getSort(), columnMap, nameToId));
+			sortOptions.add(SortOptions.of(s -> s.field(f -> f.field(SYSTEM_FIELD_ROW_ID).order(SortOrder.Asc))));
+		} else {
+			sortOptions = Collections.emptyList();
+		}
+
+		// Cursor pagination: when a searchAfter cursor is supplied it defines the position, so
+		// `from` is forced to 0 (OpenSearch rejects from + search_after together).
+		List<FieldValue> searchAfter = parseSearchAfterCursor(query.getSearchAfter());
 
 		Map<String, String> idToName = columns.stream()
 				.collect(Collectors.toMap(ColumnModel::getId, ColumnModel::getName, (a2, b) -> a2));
 
 		return callSearchApi(indexName, boolBuilder, offset, limit, aggregations,
-				highlightFields, returnFields, sortOptions, idToName, options);
+				highlightFields, returnFields, sortOptions, idToName, options,
+				searchAfter, opaqueAggregations);
 	}
 
 	@SuppressWarnings("rawtypes")
@@ -1280,14 +1305,17 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			int offset, int limit, Map<String, Aggregation> aggregations,
 			Map<String, HighlightField> highlightFields, List<String> returnFields,
 			List<SortOptions> sortOptions, Map<String, String> idToName,
-			Set<SearchQueryPart> options) {
+			Set<SearchQueryPart> options, List<FieldValue> searchAfter, boolean opaqueAggregations) {
 		boolean returnHits = options.contains(SearchQueryPart.HITS);
 		boolean returnTotalHits = options.contains(SearchQueryPart.TOTAL_HITS);
+		boolean usingCursor = searchAfter != null && !searchAfter.isEmpty();
 		try {
 			SearchResponse<Map> response = openSearchClient.search(req -> {
 				req.index(indexName);
 				req.query(q -> q.bool(boolBuilder.build()));
-				req.from(offset);
+				// A search_after cursor defines the position; OpenSearch rejects it together
+				// with a non-zero `from`, so pin from to 0 in cursor mode.
+				req.from(usingCursor ? 0 : offset);
 				// size=0 when hits aren't requested — saves source fetch + transport cost
 				req.size(returnHits ? limit : 0);
 				if (returnTotalHits) {
@@ -1311,12 +1339,15 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 					if (!sortOptions.isEmpty()) {
 						req.sort(sortOptions);
 					}
+					if (usingCursor) {
+						req.searchAfter(searchAfter);
+					}
 				}
 
 				return req;
 			}, Map.class);
 
-			return convertResponse(response, indexName, offset, idToName, options);
+			return convertResponse(response, indexName, offset, limit, idToName, options, opaqueAggregations);
 		} catch (OpenSearchException e) {
 			if (INDEX_NOT_FOUND_EXCEPTION.equals(e.error().type())) {
 				throw new IllegalStateException("Search index is still building. Please try again later.", e);
@@ -1345,6 +1376,114 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
 				.createParser(new StringReader(dsl.toString()))) {
 			return Query._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER);
+		}
+	}
+
+	/**
+	 * Convert a caller-supplied opaque aggregations object (map of aggregation name to
+	 * definition) into the typed {@code Map<String, Aggregation>} OpenSearch expects, after
+	 * enforcing the aggregation allowlist (rejecting scripted / pipeline aggregations and any
+	 * embedded script with HTTP 400). Field references resolve through the per-column aliases.
+	 */
+	Map<String, Aggregation> buildOpaqueAggregations(Object opaqueAggregationsDsl) {
+		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueAggregationsDsl);
+		SearchAggregationDslAllowlist.validate(dsl);
+		Map<String, Aggregation> result = new LinkedHashMap<>();
+		Iterator<Map.Entry<String, JsonNode>> entries = dsl.fields();
+		while (entries.hasNext()) {
+			Map.Entry<String, JsonNode> entry = entries.next();
+			try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
+					.createParser(new StringReader(entry.getValue().toString()))) {
+				result.put(entry.getKey(), Aggregation._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER));
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Parse an opaque search_after cursor (a JSON array string previously emitted as
+	 * {@code nextSearchAfter}) into the typed {@link FieldValue} list OpenSearch expects.
+	 * Returns {@code null} for a null/blank cursor (first page).
+	 */
+	static List<FieldValue> parseSearchAfterCursor(String cursor) {
+		if (cursor == null || cursor.trim().isEmpty()) {
+			return null;
+		}
+		JsonNode array;
+		try {
+			array = new ObjectMapper().readTree(cursor);
+		} catch (IOException e) {
+			throw new IllegalArgumentException("searchAfter cursor is not valid JSON", e);
+		}
+		if (!array.isArray()) {
+			throw new IllegalArgumentException("searchAfter cursor must be a JSON array");
+		}
+		List<FieldValue> values = new ArrayList<>();
+		for (JsonNode element : array) {
+			values.add(jsonNodeToFieldValue(element));
+		}
+		return values;
+	}
+
+	private static FieldValue jsonNodeToFieldValue(JsonNode element) {
+		if (element.isIntegralNumber()) {
+			return FieldValue.of(element.asLong());
+		}
+		if (element.isNumber()) {
+			return FieldValue.of(element.asDouble());
+		}
+		if (element.isBoolean()) {
+			return FieldValue.of(element.asBoolean());
+		}
+		if (element.isTextual()) {
+			return FieldValue.of(element.asText());
+		}
+		throw new IllegalArgumentException(
+				"unsupported searchAfter cursor element (null/object/array not allowed): " + element);
+	}
+
+	/** Serialize a hit's sort values into the opaque JSON-array cursor returned as nextSearchAfter. */
+	static String serializeCursor(List<FieldValue> sortValues) {
+		ArrayNode array = new ObjectMapper().createArrayNode();
+		for (FieldValue value : sortValues) {
+			if (value.isLong()) {
+				array.add(value.longValue());
+			} else if (value.isDouble()) {
+				array.add(value.doubleValue());
+			} else if (value.isBoolean()) {
+				array.add(value.booleanValue());
+			} else if (value.isString()) {
+				array.add(value.stringValue());
+			} else {
+				array.addNull();
+			}
+		}
+		return array.toString();
+	}
+
+	/**
+	 * Serialize the typed aggregation results into the opaque JSON string returned as
+	 * {@code aggregationResults}. Each {@link Aggregate} is serialized independently through the
+	 * OpenSearch JsonpMapper, then nested under its aggregation name.
+	 */
+	static String serializeAggregationResults(Map<String, Aggregate> aggregations) {
+		ObjectMapper jackson = new ObjectMapper();
+		ObjectNode root = jackson.createObjectNode();
+		for (Map.Entry<String, Aggregate> entry : aggregations.entrySet()) {
+			StringWriter writer = new StringWriter();
+			try (JsonGenerator generator = QUERY_JSONP_MAPPER.jsonProvider().createGenerator(writer)) {
+				entry.getValue().serialize(generator, QUERY_JSONP_MAPPER);
+			}
+			try {
+				root.set(entry.getKey(), jackson.readTree(writer.toString()));
+			} catch (IOException e) {
+				throw new IllegalStateException("Failed to re-parse serialized aggregation result", e);
+			}
+		}
+		try {
+			return jackson.writeValueAsString(root);
+		} catch (JsonProcessingException e) {
+			throw new IllegalStateException("Failed to serialize aggregation results", e);
 		}
 	}
 
@@ -1642,7 +1781,8 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 	@SuppressWarnings({"rawtypes", "unchecked"})
 	SearchQueryResults convertResponse(SearchResponse<Map> response, String indexName, int offset,
-			Map<String, String> idToName, Set<SearchQueryPart> options) {
+			int limit, Map<String, String> idToName, Set<SearchQueryPart> options,
+			boolean opaqueAggregations) {
 		SearchQueryResults results = new SearchQueryResults();
 		results.setOffset((long) offset);
 
@@ -1651,16 +1791,33 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 
 		if (options.contains(SearchQueryPart.HITS)) {
+			List<Hit<Map>> rawHits = response.hits().hits();
 			List<SearchHit> hits = new ArrayList<>();
-			for (Hit<Map> hit : response.hits().hits()) {
+			for (Hit<Map> hit : rawHits) {
 				hits.add(convertHit(hit, idToName));
 			}
 			results.setHits(hits);
+
+			// Emit a forward cursor only when a full page came back (a short page is the last
+			// page). The cursor is the last hit's sort values — opaque to the caller, echoed
+			// back verbatim as the next request's searchAfter.
+			if (limit > 0 && rawHits.size() == limit) {
+				List<FieldValue> lastSort = rawHits.get(rawHits.size() - 1).sort();
+				if (lastSort != null && !lastSort.isEmpty()) {
+					results.setNextSearchAfter(serializeCursor(lastSort));
+				}
+			}
 		}
 
 		if (options.contains(SearchQueryPart.FACETS)
 				&& response.aggregations() != null && !response.aggregations().isEmpty()) {
-			results.setFacets(convertAggregations(response.aggregations(), idToName));
+			if (opaqueAggregations) {
+				// The opaque-aggregations path returns the raw OpenSearch results as a JSON
+				// string for the caller to parse; the terms-facet path keeps the typed facets.
+				results.setAggregationResults(serializeAggregationResults(response.aggregations()));
+			} else {
+				results.setFacets(convertAggregations(response.aggregations(), idToName));
+			}
 		}
 
 		return results;

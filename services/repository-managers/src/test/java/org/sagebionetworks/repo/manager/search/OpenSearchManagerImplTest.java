@@ -1379,6 +1379,77 @@ public class OpenSearchManagerImplTest {
 				() -> manager.buildOpaqueQuery("{\"script\":{\"script\":\"doc['x'].value\"}}"));
 	}
 
+	@Test
+	public void testBuildOpaqueAggregationsWithAllowedDsl() {
+		// call under test
+		Map<String, org.opensearch.client.opensearch._types.aggregations.Aggregation> aggs =
+				manager.buildOpaqueAggregations("{\"by_assay\":{\"terms\":{\"field\":\"assay\"}}}");
+		assertTrue(aggs.containsKey("by_assay"));
+		assertTrue(aggs.get("by_assay").isTerms(), "terms agg should deserialize to a typed terms aggregation");
+	}
+
+	@Test
+	public void testBuildOpaqueAggregationsWithScriptedMetricRejected() {
+		// scripted_metric is not allowlisted. call under test
+		assertThrows(IllegalArgumentException.class, () -> manager.buildOpaqueAggregations(
+				"{\"x\":{\"scripted_metric\":{\"map_script\":\"state.x=1\"}}}"));
+	}
+
+	@Test
+	public void testParseSearchAfterCursorWithMixedTypes() {
+		// call under test
+		List<org.opensearch.client.opensearch._types.FieldValue> values =
+				OpenSearchManagerImpl.parseSearchAfterCursor("[12345, 1.5, \"abc\", true]");
+		assertEquals(4, values.size());
+		assertTrue(values.get(0).isLong());
+		assertEquals(12345L, values.get(0).longValue());
+		assertTrue(values.get(1).isDouble());
+		assertTrue(values.get(2).isString());
+		assertEquals("abc", values.get(2).stringValue());
+		assertTrue(values.get(3).isBoolean());
+	}
+
+	@Test
+	public void testParseSearchAfterCursorWithNullOrBlankReturnsNull() {
+		// call under test
+		assertNull(OpenSearchManagerImpl.parseSearchAfterCursor(null));
+		assertNull(OpenSearchManagerImpl.parseSearchAfterCursor("   "));
+	}
+
+	@Test
+	public void testParseSearchAfterCursorWithNonArrayRejected() {
+		// call under test
+		assertThrows(IllegalArgumentException.class,
+				() -> OpenSearchManagerImpl.parseSearchAfterCursor("{\"not\":\"array\"}"));
+	}
+
+	@Test
+	public void testSerializeCursorRoundTripsThroughParse() {
+		List<org.opensearch.client.opensearch._types.FieldValue> original = List.of(
+				org.opensearch.client.opensearch._types.FieldValue.of(98765L),
+				org.opensearch.client.opensearch._types.FieldValue.of(3.25),
+				org.opensearch.client.opensearch._types.FieldValue.of("xyz"));
+		// call under test
+		String cursor = OpenSearchManagerImpl.serializeCursor(original);
+		List<org.opensearch.client.opensearch._types.FieldValue> reparsed =
+				OpenSearchManagerImpl.parseSearchAfterCursor(cursor);
+		assertEquals(98765L, reparsed.get(0).longValue());
+		assertEquals(3.25, reparsed.get(1).doubleValue());
+		assertEquals("xyz", reparsed.get(2).stringValue());
+	}
+
+	@Test
+	public void testSerializeAggregationResultsNestsByName() throws IOException {
+		Map<String, org.opensearch.client.opensearch._types.aggregations.Aggregate> aggs = Map.of(
+				"citation_stats", org.opensearch.client.opensearch._types.aggregations.Aggregate.of(
+						a -> a.avg(av -> av.value(2.5))));
+		// call under test
+		String json = OpenSearchManagerImpl.serializeAggregationResults(aggs);
+		com.fasterxml.jackson.databind.JsonNode root =
+				new com.fasterxml.jackson.databind.ObjectMapper().readTree(json);
+		assertEquals(2.5, root.path("citation_stats").path("value").asDouble());
+	}
+
 	private static BulkResponseItem okItem(String id) {
 		return BulkResponseItem.of(b -> b
 				.index("search-index-syn1")
@@ -1786,7 +1857,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.TOTAL_HITS));
+				EnumSet.of(SearchQueryPart.TOTAL_HITS), null, false);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1805,7 +1876,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.HITS));
+				EnumSet.of(SearchQueryPart.HITS), null, false);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));

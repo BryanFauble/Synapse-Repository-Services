@@ -31,6 +31,14 @@
 				"$ref": "org.sagebionetworks.repo.model.table.FacetColumnResult"
 			}
 		},
+		"aggregationResults": {
+			"type": "string",
+			"description": "The raw OpenSearch aggregation results as a JSON string (a map of aggregation name to its result), populated when the request supplied the opaque aggregations object AND SearchQueryPart.FACETS is requested. Mutually exclusive with facets: the terms-facet path populates facets, the opaque-aggregations path populates this. Returned as an opaque JSON string for the caller to parse — its shape mirrors the aggregation types in the request."
+		},
+		"nextSearchAfter": {
+			"type": "string",
+			"description": "Opaque pagination cursor for the next page. When SearchQueryPart.HITS is requested and a full page (limit hits) was returned, this carries the cursor of the last returned hit; pass it back verbatim as the next request's searchAfter to continue. Null when there are no further pages (fewer than limit hits were returned)."
+		},
 		"offset": {
 			"type": "integer",
 			"description": "Zero-based pagination offset echoed from the request. Always populated."

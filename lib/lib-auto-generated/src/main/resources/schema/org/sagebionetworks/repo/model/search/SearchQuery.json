@@ -54,10 +54,14 @@
 		},
 		"facetRequests": {
 			"type": "array",
-			"description": "Columns to aggregate as facet buckets alongside the primary hit results. Each entry produces one terms aggregation; use maxValueCount to cap the bucket count, and sortField/sortDirection to order buckets by count or by key. Returned in SearchQueryResults.facets only when the caller opts into the FACETS response part.",
+			"description": "Columns to aggregate as facet buckets alongside the primary hit results. Each entry produces one terms aggregation; use maxValueCount to cap the bucket count, and sortField/sortDirection to order buckets by count or by key. Returned in SearchQueryResults.facets only when the caller opts into the FACETS response part. For aggregations beyond a terms facet (histograms, stats, cardinality, ranges, nested sub-aggregations), supply the opaque 'aggregations' object instead — it takes precedence over facetRequests.",
 			"items": {
 				"$ref": "org.sagebionetworks.repo.model.search.FacetRequest"
 			}
+		},
+		"aggregations": {
+			"type": "object",
+			"description": "<p>Optional. An OpenSearch aggregations object — the contents of the <code>aggs</code> / <code>aggregations</code> key (a map of aggregation name to aggregation definition), NOT wrapped in an outer envelope. When present it takes precedence over <code>facetRequests</code>; the raw aggregation results are returned as a JSON string in <code>SearchQueryResults.aggregationResults</code> when the FACETS response part is requested (and <code>facets</code> is left empty).</p><p><b>Field references use column names</b> (resolved by the per-column field aliases), and which columns are aggregatable follows from the Synapse column type — keyword / numeric / date / boolean columns carry doc values; analyzed <code>text</code> columns do not.</p><p><b>Allowlisted aggregation types only.</b> Permitted: <code>terms</code>, <code>histogram</code>, <code>date_histogram</code>, <code>range</code>, <code>date_range</code>, <code>min</code>, <code>max</code>, <code>avg</code>, <code>sum</code>, <code>stats</code>, <code>extended_stats</code>, <code>value_count</code>, <code>cardinality</code>, <code>missing</code>, plus nested sub-aggregations via <code>aggs</code> / <code>aggregations</code>. Script-based aggregations (e.g. <code>scripted_metric</code>), pipeline aggregations, and any embedded <code>script</code> are rejected with HTTP 400, as is a tree deeper than 10 levels or wider than 100 aggregations.</p><p><b>Example</b> — publications per year plus the citation-count distribution:</p><pre><code>\"aggregations\": {\n  \"per_year\": { \"date_histogram\": { \"field\": \"published_on\", \"calendar_interval\": \"year\" } },\n  \"citation_stats\": { \"stats\": { \"field\": \"citation_count\" } }\n}</code></pre>"
 		},
 		"returnFields": {
 			"type": "array",
@@ -84,6 +88,10 @@
 		"limit": {
 			"type": "integer",
 			"description": "Maximum number of hits to return per page. Default: 25. Maximum: 100 (larger values are silently capped). Set to 0 in combination with FACETS-only response parts to retrieve only aggregate counts."
+		},
+		"searchAfter": {
+			"type": "string",
+			"description": "<p>Optional. Cursor for deep, stable pagination past the offset window (OpenSearch caps offset+limit at ~10,000). To page forward, echo the <code>nextSearchAfter</code> value from the previous response verbatim — it is an opaque token; do not construct or parse it. When set, <code>offset</code> is ignored (the cursor defines the position) and the server appends a row-id tiebreaker to your <code>sort</code> so the ordering is total and deterministic. Omit on the first page; a null <code>nextSearchAfter</code> in the response means there are no more pages.</p>"
 		}
 	}
 }
