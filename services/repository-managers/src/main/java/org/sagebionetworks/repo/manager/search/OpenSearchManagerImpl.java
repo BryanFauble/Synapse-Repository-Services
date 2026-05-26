@@ -1,8 +1,6 @@
 package org.sagebionetworks.repo.manager.search;
 
 import java.io.IOException;
-import java.io.StringReader;
-import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -17,12 +15,8 @@ import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import jakarta.json.stream.JsonGenerator;
-import jakarta.json.stream.JsonParser;
 
 import org.opensearch.client.json.JsonData;
-import org.opensearch.client.json.JsonpMapper;
-import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch._types.ErrorCause;
 import org.opensearch.client.opensearch._types.FieldSort;
@@ -385,10 +379,9 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	private static String patchSemanticEnrichment(String typedRequestBody,
 			Map<String, String> enrichmentByColumnId) {
-		ObjectMapper jackson = JSON_MAPPER;
 		ObjectNode root;
 		try {
-			root = (ObjectNode) jackson.readTree(typedRequestBody);
+			root = (ObjectNode) JSON_MAPPER.readTree(typedRequestBody);
 		} catch (IOException e) {
 			throw new IllegalStateException("Failed to re-parse typed create-index body for semantic_enrichment patch", e);
 		}
@@ -409,16 +402,12 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 				// throw so the build is resilient to a column rename racing the build.
 				continue;
 			}
-			ObjectNode semanticBlock = jackson.createObjectNode();
+			ObjectNode semanticBlock = JSON_MAPPER.createObjectNode();
 			semanticBlock.put("status", "ENABLED");
 			semanticBlock.put("language_options", languageOption);
 			((ObjectNode) propertyNode).set("semantic_enrichment", semanticBlock);
 		}
-		try {
-			return jackson.writeValueAsString(root);
-		} catch (JsonProcessingException e) {
-			throw new IllegalStateException("Failed to serialize patched create-index body", e);
-		}
+		return SearchOpaqueJsonUtil.toJsonString(root);
 	}
 
 	/**
@@ -1412,16 +1401,10 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 	}
 
-	// Deserializes the allowlisted caller DSL into a typed Query. A standalone JacksonJsonpMapper
-	// (no transport) is sufficient for query deserialization — same pattern SearchOpaqueJsonUtil
-	// uses for analyzer settings.
-	private static final JsonpMapper QUERY_JSONP_MAPPER = new JacksonJsonpMapper();
-
-	// Shared Jackson mapper for the JSON assembly the typed OpenSearch / DTO layers don't cover:
-	// patching the create-index body, serializing aggregation / suggester results, and the
-	// search_after cursor. ObjectMapper is thread-safe once configured, so a single instance is
-	// reused rather than constructed per call. The opaque request-side parsing (query /
-	// aggregations / suggest inputs) goes through SearchOpaqueJsonUtil.parse instead.
+	// Shared Jackson mapper for the lightweight node assembly the typed OpenSearch / DTO layers
+	// don't cover: building the result/cursor JSON containers and patching the create-index body.
+	// The typed-object (JsonP) serialize/deserialize bridging and opaque-input parsing both go
+	// through SearchOpaqueJsonUtil.
 	private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
 	/**
@@ -1433,10 +1416,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	Query buildOpaqueQuery(Object opaqueQueryDsl) {
 		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueQueryDsl);
 		SearchQueryDslAllowlist.validate(dsl);
-		try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
-				.createParser(new StringReader(dsl.toString()))) {
-			return Query._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER);
-		}
+		return SearchOpaqueJsonUtil.fromJsonpTree(dsl, Query._DESERIALIZER);
 	}
 
 	/**
@@ -1449,14 +1429,8 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueAggregationsDsl);
 		SearchAggregationDslAllowlist.validate(dsl);
 		Map<String, Aggregation> result = new LinkedHashMap<>();
-		Iterator<Map.Entry<String, JsonNode>> entries = dsl.fields();
-		while (entries.hasNext()) {
-			Map.Entry<String, JsonNode> entry = entries.next();
-			try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
-					.createParser(new StringReader(entry.getValue().toString()))) {
-				result.put(entry.getKey(), Aggregation._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER));
-			}
-		}
+		dsl.fields().forEachRemaining(entry -> result.put(entry.getKey(),
+				SearchOpaqueJsonUtil.fromJsonpTree(entry.getValue(), Aggregation._DESERIALIZER)));
 		return result;
 	}
 
@@ -1468,10 +1442,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	Suggester buildOpaqueSuggest(Object opaqueSuggestDsl) {
 		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueSuggestDsl);
 		SearchSuggestDslAllowlist.validate(dsl);
-		try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
-				.createParser(new StringReader(dsl.toString()))) {
-			return Suggester._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER);
-		}
+		return SearchOpaqueJsonUtil.fromJsonpTree(dsl, Suggester._DESERIALIZER);
 	}
 
 	/**
@@ -1534,28 +1505,13 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	@SuppressWarnings("rawtypes")
 	static String serializeSuggest(Map<String, List<Suggest<Map>>> suggest) {
-		ObjectMapper jackson = JSON_MAPPER;
-		ObjectNode root = jackson.createObjectNode();
-		for (Map.Entry<String, List<Suggest<Map>>> entry : suggest.entrySet()) {
-			ArrayNode array = jackson.createArrayNode();
-			for (Suggest<Map> suggestion : entry.getValue()) {
-				StringWriter writer = new StringWriter();
-				try (JsonGenerator generator = QUERY_JSONP_MAPPER.jsonProvider().createGenerator(writer)) {
-					suggestion.serialize(generator, QUERY_JSONP_MAPPER);
-				}
-				try {
-					array.add(jackson.readTree(writer.toString()));
-				} catch (IOException e) {
-					throw new IllegalStateException("Failed to re-parse serialized suggestion", e);
-				}
-			}
-			root.set(entry.getKey(), array);
-		}
-		try {
-			return jackson.writeValueAsString(root);
-		} catch (JsonProcessingException e) {
-			throw new IllegalStateException("Failed to serialize suggest results", e);
-		}
+		ObjectNode root = JSON_MAPPER.createObjectNode();
+		suggest.forEach((name, suggestions) -> {
+			ArrayNode array = JSON_MAPPER.createArrayNode();
+			suggestions.forEach(s -> array.add(SearchOpaqueJsonUtil.toJsonpTree(s)));
+			root.set(name, array);
+		});
+		return SearchOpaqueJsonUtil.toJsonString(root);
 	}
 
 	/**
@@ -1625,24 +1581,9 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 * OpenSearch JsonpMapper, then nested under its aggregation name.
 	 */
 	static String serializeAggregationResults(Map<String, Aggregate> aggregations) {
-		ObjectMapper jackson = JSON_MAPPER;
-		ObjectNode root = jackson.createObjectNode();
-		for (Map.Entry<String, Aggregate> entry : aggregations.entrySet()) {
-			StringWriter writer = new StringWriter();
-			try (JsonGenerator generator = QUERY_JSONP_MAPPER.jsonProvider().createGenerator(writer)) {
-				entry.getValue().serialize(generator, QUERY_JSONP_MAPPER);
-			}
-			try {
-				root.set(entry.getKey(), jackson.readTree(writer.toString()));
-			} catch (IOException e) {
-				throw new IllegalStateException("Failed to re-parse serialized aggregation result", e);
-			}
-		}
-		try {
-			return jackson.writeValueAsString(root);
-		} catch (JsonProcessingException e) {
-			throw new IllegalStateException("Failed to serialize aggregation results", e);
-		}
+		ObjectNode root = JSON_MAPPER.createObjectNode();
+		aggregations.forEach((name, aggregate) -> root.set(name, SearchOpaqueJsonUtil.toJsonpTree(aggregate)));
+		return SearchOpaqueJsonUtil.toJsonString(root);
 	}
 
 	Query buildMainQuery(SearchQueryType queryType, String queryText, List<String> fields, String fuzziness) {

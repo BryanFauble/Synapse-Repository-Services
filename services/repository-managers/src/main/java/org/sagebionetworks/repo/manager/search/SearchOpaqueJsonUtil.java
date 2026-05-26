@@ -1,15 +1,21 @@
 package org.sagebionetworks.repo.manager.search;
 
 import java.io.StringReader;
+import java.io.StringWriter;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 
+import jakarta.json.stream.JsonGenerator;
+import jakarta.json.stream.JsonParser;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.opensearch.client.json.JsonpDeserializer;
 import org.opensearch.client.json.JsonpMapper;
+import org.opensearch.client.json.JsonpSerializable;
 import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 import org.opensearch.client.opensearch.indices.IndexSettingsAnalysis;
 import org.sagebionetworks.schema.adapter.JSONObjectAdapter;
@@ -138,6 +144,37 @@ public final class SearchOpaqueJsonUtil {
 			return MAPPER.writeValueAsString(json);
 		} catch (JsonProcessingException e) {
 			throw new IllegalArgumentException("Invalid JSON: " + e.getOriginalMessage(), e);
+		}
+	}
+
+	// ---------- OpenSearch typed-object (JsonP) bridging ----------
+
+	/**
+	 * Deserialize a JSON tree into a typed OpenSearch client object via its
+	 * {@link JsonpDeserializer} (e.g. {@code Query._DESERIALIZER},
+	 * {@code Aggregation._DESERIALIZER}). Reuses the shared {@link #JSONP_MAPPER} so callers
+	 * don't repeat the parser/mapper plumbing.
+	 */
+	public static <T> T fromJsonpTree(JsonNode node, JsonpDeserializer<T> deserializer) {
+		try (JsonParser parser = JSONP_MAPPER.jsonProvider().createParser(new StringReader(node.toString()))) {
+			return deserializer.deserialize(parser, JSONP_MAPPER);
+		}
+	}
+
+	/**
+	 * Serialize a typed OpenSearch client object ({@code Aggregate}, {@code Suggest},
+	 * {@code FieldValue}, ...) to a Jackson tree — the inverse of {@link #fromJsonpTree}, for
+	 * assembling typed results back into an opaque JSON response.
+	 */
+	public static JsonNode toJsonpTree(JsonpSerializable value) {
+		StringWriter writer = new StringWriter();
+		try (JsonGenerator generator = JSONP_MAPPER.jsonProvider().createGenerator(writer)) {
+			value.serialize(generator, JSONP_MAPPER);
+		}
+		try {
+			return MAPPER.readTree(writer.toString());
+		} catch (JsonProcessingException e) {
+			throw new IllegalStateException("Failed to re-parse serialized OpenSearch value", e);
 		}
 	}
 
