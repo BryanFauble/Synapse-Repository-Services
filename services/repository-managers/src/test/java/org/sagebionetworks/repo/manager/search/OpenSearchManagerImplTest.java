@@ -1857,7 +1857,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.TOTAL_HITS), null, false, null);
+				EnumSet.of(SearchQueryPart.TOTAL_HITS), null, false, null, null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1876,7 +1876,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.HITS), null, false, null);
+				EnumSet.of(SearchQueryPart.HITS), null, false, null, null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1895,7 +1895,7 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.HITS), null, false, "100");
+				EnumSet.of(SearchQueryPart.HITS), null, false, "100", null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
@@ -1912,11 +1912,110 @@ public class OpenSearchManagerImplTest {
 		manager.callSearchApi("my-index", new BoolQuery.Builder(),
 				0, 10, Collections.emptyMap(), null, null,
 				Collections.emptyList(), Collections.emptyMap(),
-				EnumSet.of(SearchQueryPart.HITS), null, false, null);
+				EnumSet.of(SearchQueryPart.HITS), null, false, null, null);
 
 		ArgumentCaptor<SearchRequest> captor = ArgumentCaptor.forClass(SearchRequest.class);
 		verify(openSearchClient).search(captor.capture(), eq(Map.class));
 		assertNull(captor.getValue().collapse(), "collapse must be unset when no collapse field is supplied");
+	}
+
+	@Test
+	public void testBuildHighlightWithOptions() {
+		List<ColumnModel> columns = List.of(
+				new ColumnModel().setId("100").setName("title").setColumnType(ColumnType.STRING),
+				new ColumnModel().setId("200").setName("year").setColumnType(ColumnType.INTEGER));
+		Map<String, String> nameToId = Map.of("title", "100", "year", "200");
+		org.sagebionetworks.repo.model.search.SearchHighlightOptions options =
+				new org.sagebionetworks.repo.model.search.SearchHighlightOptions()
+						.setFields(List.of("title"))
+						.setFragmentSize(50L)
+						.setPreTag("<mark>")
+						.setPostTag("</mark>");
+
+		// call under test
+		org.opensearch.client.opensearch.core.search.Highlight highlight =
+				manager.buildHighlight(columns, nameToId, options);
+
+		assertNotNull(highlight);
+		// Only the requested text column is highlighted (by its column id); the integer column
+		// is never eligible.
+		assertTrue(highlight.fields().containsKey("100"));
+		assertFalse(highlight.fields().containsKey("200"));
+		assertEquals(50, highlight.fields().get("100").fragmentSize());
+		assertTrue(highlight.preTags().contains("<mark>"));
+		assertTrue(highlight.postTags().contains("</mark>"));
+	}
+
+	@Test
+	public void testBuildHighlightWithNoEligibleFieldsReturnsNull() {
+		List<ColumnModel> columns = List.of(
+				new ColumnModel().setId("200").setName("year").setColumnType(ColumnType.INTEGER));
+		// call under test
+		assertNull(manager.buildHighlight(columns, Map.of("year", "200"), null));
+	}
+
+	@Test
+	public void testBuildOpaqueSuggestWithAllowedDsl() {
+		// call under test
+		org.opensearch.client.opensearch.core.search.Suggester suggester =
+				manager.buildOpaqueSuggest("{\"did_you_mean\":{\"text\":\"amiloid\",\"term\":{\"field\":\"title\"}}}");
+		assertNotNull(suggester);
+		assertTrue(suggester.suggesters().containsKey("did_you_mean"));
+	}
+
+	@Test
+	public void testBuildOpaqueSuggestWithDisallowedRejected() {
+		// call under test
+		assertThrows(IllegalArgumentException.class,
+				() -> manager.buildOpaqueSuggest("{\"x\":{\"context\":{\"field\":\"title\"}}}"));
+	}
+
+	@Test
+	public void testBuildPropertyKeywordWithNormalizer() {
+		// call under test
+		org.opensearch.client.opensearch._types.mapping.Property p =
+				manager.buildProperty(ColumnType.ENTITYID, "org.sagebionetworks-KEYWORD", false, "biomed_lc");
+		assertTrue(p.isKeyword());
+		assertEquals("biomed_lc", p.keyword().normalizer());
+	}
+
+	@Test
+	public void testCreateIndexBindsNormalizerToKeywordColumn() throws IOException {
+		// A TextAnalyzer whose settings declare a `normalizer.default`, bound to a keyword
+		// column via a ColumnAnalyzerOverride: the keyword field must get `normalizer` set to
+		// the bare aossKey, and the normalizer must be registered in the analysis block.
+		String indexName = "search-index-syn1";
+		String primaryQname = "org.sagebionetworks-SCIENTIFIC";
+		String primarySettings = "{\"analyzer\":{\"default\":{\"type\":\"custom\",\"tokenizer\":\"standard\"}}}";
+		String normQname = "biomed-lc_norm";
+		String normAossKey = OpenSearchManagerImpl.toAossKey(normQname);
+		String normSettings = "{\"normalizer\":{\"default\":{\"type\":\"custom\",\"filter\":[\"lowercase\"]}}}";
+		Map<String, IndexSettingsAnalysis> resolvedAnalyzers = new HashMap<>();
+		resolvedAnalyzers.put(primaryQname, toAnalysis(primarySettings));
+		resolvedAnalyzers.put(normQname, toAnalysis(normSettings));
+
+		List<ColumnModel> columns = Collections.singletonList(
+				new ColumnModel().setId("100").setName("tag").setColumnType(ColumnType.ENTITYID));
+		ColumnAnalyzerOverride override = new ColumnAnalyzerOverride();
+		ColumnAnalyzerOverrideEntry entry = new ColumnAnalyzerOverrideEntry();
+		entry.setColumnName("tag");
+		entry.setAnalyzer(new org.json.JSONObject().put("$ref", normQname));
+		override.setOverrides(Collections.singletonList(entry));
+
+		when(openSearchClient.indices()).thenReturn(indicesClient);
+		when(indicesClient.create(any(CreateIndexRequest.class))).thenReturn(
+				org.opensearch.client.opensearch.indices.CreateIndexResponse.of(b -> b
+						.acknowledged(true).shardsAcknowledged(true).index(indexName)));
+
+		// call under test
+		Optional<String> appliedJson = manager.createIndex(indexName, columns, primaryQname,
+				Collections.singletonList(override), resolvedAnalyzers, null);
+
+		JsonNode applied = MAPPER.readTree(appliedJson.orElseThrow());
+		assertEquals("keyword", applied.at("/mappings/properties/100/type").asText());
+		assertEquals(normAossKey, applied.at("/mappings/properties/100/normalizer").asText());
+		assertFalse(applied.at("/settings/analysis/normalizer/" + normAossKey).isMissingNode(),
+				"the default normalizer must be registered under the bare aossKey");
 	}
 
 	@Test

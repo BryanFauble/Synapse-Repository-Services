@@ -55,7 +55,10 @@ import org.opensearch.client.opensearch.core.IndexRequest;
 import org.opensearch.client.opensearch.core.SearchResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkOperation;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
+import org.opensearch.client.opensearch.core.search.Highlight;
 import org.opensearch.client.opensearch.core.search.HighlightField;
+import org.opensearch.client.opensearch.core.search.Suggest;
+import org.opensearch.client.opensearch.core.search.Suggester;
 import org.opensearch.client.opensearch.core.search.Hit;
 import org.opensearch.client.opensearch.indices.AnalyzeRequest;
 import org.opensearch.client.opensearch.indices.CreateIndexRequest;
@@ -69,6 +72,7 @@ import org.sagebionetworks.repo.model.search.SearchFieldValue;
 import org.sagebionetworks.repo.model.search.SearchHit;
 import org.sagebionetworks.repo.model.search.SearchQuery;
 import org.sagebionetworks.repo.model.search.SearchQueryPart;
+import org.sagebionetworks.repo.model.search.SearchHighlightOptions;
 import org.sagebionetworks.repo.model.search.SearchQueryResults;
 import org.sagebionetworks.repo.model.search.SearchQueryType;
 import org.sagebionetworks.repo.model.search.SortDirection;
@@ -504,6 +508,15 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		settings.charFilter().forEach((name, def) -> a.charFilter(aossKey + "__" + name, def));
 		settings.tokenizer().forEach((name, def) -> a.tokenizer(aossKey + "__" + name, def));
 		settings.filter().forEach((name, def) -> a.filter(aossKey + "__" + name, def));
+		// Normalizers (the 5th analysis slot) drive keyword-field analysis. Register each
+		// under {aossKey}__{localName}; additionally alias the entry named "default" to the
+		// bare {aossKey} so a keyword field can bind to it by qualified name (see buildProperty).
+		settings.normalizer().forEach((name, def) -> {
+			a.normalizer(aossKey + "__" + name, def);
+			if (DEFAULT_ANALYZER_NAME.equals(name)) {
+				a.normalizer(aossKey, def);
+			}
+		});
 
 		// A TextAnalyzer with no analyzer entries is structurally legal (e.g. a registry-
 		// only resource), but won't be reachable from a SearchConfiguration. Nothing more
@@ -635,7 +648,14 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			boolean hasDefaultSearch = effectiveQname != null
 					&& analyzerDeclaresDefaultSearch(resolvedAnalyzers, effectiveQname);
 
-			m.properties(columnId, buildProperty(columnType, effectiveQname, hasDefaultSearch));
+			// For a keyword column, bind a normalizer when the effective analyzer declares a
+			// `default` normalizer (keyword fields use `normalizer`, not `analyzer`). The bound
+			// key is the bare aossKey alias registered in registerAnalyzer.
+			String normalizerKey = (effectiveQname != null
+					&& analyzerDeclaresDefaultNormalizer(resolvedAnalyzers, effectiveQname))
+					? toAossKey(effectiveQname) : null;
+
+			m.properties(columnId, buildProperty(columnType, effectiveQname, hasDefaultSearch, normalizerKey));
 
 			// Emit a field alias from the user-facing column name to the column-id field so
 			// callers can reference columns by name — notably the opaque query DSL, where the
@@ -652,6 +672,12 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 				m.properties(columnName, p -> p.alias(alias -> alias.path(columnId)));
 			}
 		}
+	}
+
+	private static boolean analyzerDeclaresDefaultNormalizer(Map<String, IndexSettingsAnalysis> resolvedAnalyzers,
+			String qname) {
+		IndexSettingsAnalysis resolved = resolvedAnalyzers.get(qname);
+		return resolved != null && resolved.normalizer().containsKey(DEFAULT_ANALYZER_NAME);
 	}
 
 	private static boolean analyzerDeclaresDefaultSearch(Map<String, IndexSettingsAnalysis> resolvedAnalyzers,
@@ -1272,9 +1298,11 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			aggregations = Collections.emptyMap();
 		}
 
-		Map<String, HighlightField> highlightFields = null;
-		if (options.contains(SearchQueryPart.HITS) && Boolean.TRUE.equals(query.getHighlight())) {
-			highlightFields = buildHighlightFields(columns);
+		// Highlighting: applied when the boolean flag is set or highlightOptions is supplied.
+		Highlight highlight = null;
+		if (options.contains(SearchQueryPart.HITS)
+				&& (Boolean.TRUE.equals(query.getHighlight()) || query.getHighlightOptions() != null)) {
+			highlight = buildHighlight(columns, nameToId, query.getHighlightOptions());
 		}
 
 		List<String> returnFields = query.getReturnFields();
@@ -1306,18 +1334,23 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		Map<String, String> idToName = columns.stream()
 				.collect(Collectors.toMap(ColumnModel::getId, ColumnModel::getName, (a2, b) -> a2));
 
+		// Query-assistance suggesters (did-you-mean / completion). Allowlist-validated, then
+		// deserialized into the typed Suggester; results come back on suggestResults.
+		org.opensearch.client.opensearch.core.search.Suggester suggester =
+				query.getSuggest() != null ? buildOpaqueSuggest(query.getSuggest()) : null;
+
 		return callSearchApi(indexName, boolBuilder, offset, limit, aggregations,
-				highlightFields, returnFields, sortOptions, idToName, options,
-				searchAfter, opaqueAggregations, collapseField);
+				highlight, returnFields, sortOptions, idToName, options,
+				searchAfter, opaqueAggregations, collapseField, suggester);
 	}
 
 	@SuppressWarnings("rawtypes")
 	SearchQueryResults callSearchApi(String indexName, BoolQuery.Builder boolBuilder,
 			int offset, int limit, Map<String, Aggregation> aggregations,
-			Map<String, HighlightField> highlightFields, List<String> returnFields,
+			org.opensearch.client.opensearch.core.search.Highlight highlight, List<String> returnFields,
 			List<SortOptions> sortOptions, Map<String, String> idToName,
 			Set<SearchQueryPart> options, List<FieldValue> searchAfter, boolean opaqueAggregations,
-			String collapseField) {
+			String collapseField, org.opensearch.client.opensearch.core.search.Suggester suggester) {
 		boolean returnHits = options.contains(SearchQueryPart.HITS);
 		boolean returnTotalHits = options.contains(SearchQueryPart.TOTAL_HITS);
 		boolean usingCursor = searchAfter != null && !searchAfter.isEmpty();
@@ -1340,10 +1373,15 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 				if (!aggregations.isEmpty()) {
 					req.aggregations(aggregations);
 				}
+				// Suggesters are independent of hits (they return their own section), so set
+				// regardless of returnHits.
+				if (suggester != null) {
+					req.suggest(suggester);
+				}
 				// Highlights and source filters are meaningless without hits.
 				if (returnHits) {
-					if (highlightFields != null && !highlightFields.isEmpty()) {
-						req.highlight(h -> h.fields(highlightFields));
+					if (highlight != null) {
+						req.highlight(highlight);
 					}
 					if (returnFields != null && !returnFields.isEmpty()) {
 						req.source(src -> src.filter(f -> f.includes(returnFields)));
@@ -1413,6 +1451,104 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			}
 		}
 		return result;
+	}
+
+	/**
+	 * Convert a caller-supplied opaque suggesters object into a typed {@link Suggester} after
+	 * enforcing the suggester allowlist (rejecting non-allowlisted suggesters and embedded
+	 * scripts with HTTP 400). Field references resolve through the per-column aliases.
+	 */
+	Suggester buildOpaqueSuggest(Object opaqueSuggestDsl) {
+		JsonNode dsl = SearchOpaqueJsonUtil.parse(opaqueSuggestDsl);
+		SearchSuggestDslAllowlist.validate(dsl);
+		try (JsonParser parser = QUERY_JSONP_MAPPER.jsonProvider()
+				.createParser(new StringReader(dsl.toString()))) {
+			return Suggester._DESERIALIZER.deserialize(parser, QUERY_JSONP_MAPPER);
+		}
+	}
+
+	/**
+	 * Build the OpenSearch {@link Highlight} for a query. Highlights every text / link column
+	 * (or only the columns named in {@code options.fields}), applying the optional fragment
+	 * sizing and pre/post tags. Returns {@code null} when no eligible field is selected.
+	 */
+	Highlight buildHighlight(List<ColumnModel> columns, Map<String, String> nameToId,
+			SearchHighlightOptions options) {
+		Set<String> requestedFieldIds = null;
+		if (options != null && options.getFields() != null && !options.getFields().isEmpty()) {
+			requestedFieldIds = options.getFields().stream()
+					.map(name -> nameToId.getOrDefault(name, name))
+					.collect(Collectors.toSet());
+		}
+		Map<String, HighlightField> fields = new HashMap<>();
+		for (ColumnModel column : columns) {
+			ColumnType colType = column.getColumnType();
+			if (!ColumnTypeToOpenSearchMapping.isTextType(colType)
+					&& !ColumnTypeToOpenSearchMapping.isLinkType(colType)) {
+				continue;
+			}
+			String columnId = column.getId();
+			if (requestedFieldIds != null && !requestedFieldIds.contains(columnId)) {
+				continue;
+			}
+			fields.put(columnId, HighlightField.of(h -> {
+				if (options != null) {
+					if (options.getFragmentSize() != null) {
+						h.fragmentSize(options.getFragmentSize().intValue());
+					}
+					if (options.getNumberOfFragments() != null) {
+						h.numberOfFragments(options.getNumberOfFragments().intValue());
+					}
+				}
+				return h;
+			}));
+		}
+		if (fields.isEmpty()) {
+			return null;
+		}
+		return Highlight.of(hl -> {
+			hl.fields(fields);
+			if (options != null) {
+				if (options.getPreTag() != null) {
+					hl.preTags(options.getPreTag());
+				}
+				if (options.getPostTag() != null) {
+					hl.postTags(options.getPostTag());
+				}
+			}
+			return hl;
+		});
+	}
+
+	/**
+	 * Serialize the typed suggester results into the opaque JSON string returned as
+	 * {@code suggestResults}: a map of suggestion name to its list of options. Each
+	 * {@link Suggest} is serialized independently through the OpenSearch JsonpMapper.
+	 */
+	@SuppressWarnings("rawtypes")
+	static String serializeSuggest(Map<String, List<Suggest<Map>>> suggest) {
+		ObjectMapper jackson = new ObjectMapper();
+		ObjectNode root = jackson.createObjectNode();
+		for (Map.Entry<String, List<Suggest<Map>>> entry : suggest.entrySet()) {
+			ArrayNode array = jackson.createArrayNode();
+			for (Suggest<Map> suggestion : entry.getValue()) {
+				StringWriter writer = new StringWriter();
+				try (JsonGenerator generator = QUERY_JSONP_MAPPER.jsonProvider().createGenerator(writer)) {
+					suggestion.serialize(generator, QUERY_JSONP_MAPPER);
+				}
+				try {
+					array.add(jackson.readTree(writer.toString()));
+				} catch (IOException e) {
+					throw new IllegalStateException("Failed to re-parse serialized suggestion", e);
+				}
+			}
+			root.set(entry.getKey(), array);
+		}
+		try {
+			return jackson.writeValueAsString(root);
+		} catch (JsonProcessingException e) {
+			throw new IllegalStateException("Failed to serialize suggest results", e);
+		}
 	}
 
 	/**
@@ -1835,6 +1971,12 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			}
 		}
 
+		// Suggester results (did-you-mean / completion) are returned as an opaque JSON string,
+		// populated whenever the response carries a suggest section.
+		if (response.suggest() != null && !response.suggest().isEmpty()) {
+			results.setSuggestResults(serializeSuggest(response.suggest()));
+		}
+
 		return results;
 	}
 
@@ -1971,6 +2113,17 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	Property buildProperty(ColumnType columnType,
 			String qname, boolean hasDefaultSearch) {
+		return buildProperty(columnType, qname, hasDefaultSearch, null);
+	}
+
+	/**
+	 * Variant that also binds a keyword normalizer. {@code normalizerKey} is the bare-qname
+	 * registry key of a {@code default} normalizer (see registerAnalyzer) and is applied only
+	 * to keyword-type columns — keyword fields use the {@code normalizer} mapping param rather
+	 * than {@code analyzer}. Null leaves the keyword field un-normalized.
+	 */
+	Property buildProperty(ColumnType columnType,
+			String qname, boolean hasDefaultSearch, String normalizerKey) {
 
 		// LINK columns map exactly like TEXT columns. Users who want full-text search
 		// on a URL pick a text-style analyzer via ColumnAnalyzerOverride; users who want
@@ -1983,7 +2136,13 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		if (ColumnTypeToOpenSearchMapping.isKeywordType(columnType)) {
 			Integer ignoreAbove = ColumnTypeToOpenSearchMapping.getIgnoreAbove(columnType);
 			int ia = ignoreAbove != null ? ignoreAbove : 256;
-			return Property.of(p -> p.keyword(k -> k.ignoreAbove(ia)));
+			return Property.of(p -> p.keyword(k -> {
+				k.ignoreAbove(ia);
+				if (normalizerKey != null) {
+					k.normalizer(normalizerKey);
+				}
+				return k;
+			}));
 		}
 
 		if (ColumnTypeToOpenSearchMapping.isLongType(columnType)) {

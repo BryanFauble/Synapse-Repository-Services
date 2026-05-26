@@ -79,7 +79,15 @@
 		},
 		"highlight": {
 			"type": "boolean",
-			"description": "When true, each hit's field list includes HTML-tagged excerpts showing where the query matched. Uses OpenSearch's default highlighter with <em> tags around matched terms. Default: false. Ignored by autocomplete endpoint."
+			"description": "When true, each hit's field list includes HTML-tagged excerpts showing where the query matched. Uses OpenSearch's default highlighter with <em> tags around matched terms. Default: false. Ignored by autocomplete endpoint. For control over which columns, snippet size, snippet count, or tags, set 'highlightOptions' instead (which implies highlighting even when this flag is false)."
+		},
+		"highlightOptions": {
+			"$ref": "org.sagebionetworks.repo.model.search.SearchHighlightOptions",
+			"description": "Optional. Fine-grained highlighting controls (fields, fragment size/count, tags). When present, highlighting is applied regardless of the boolean 'highlight' flag."
+		},
+		"suggest": {
+			"type": "object",
+			"description": "<p>Optional. An OpenSearch suggesters object — the contents of the <code>suggest</code> key (a map of suggestion name to suggester definition, optionally with a top-level <code>text</code>). Returns query-assistance suggestions (did-you-mean / completion) as a JSON string in <code>SearchQueryResults.suggestResults</code>.</p><p><b>Field references use column names</b> (resolved by the per-column aliases). <b>Allowlisted suggester types only</b>: <code>term</code>, <code>phrase</code>, <code>completion</code>. Any other suggester, and any embedded <code>script</code> (e.g. a phrase <code>collate</code> script), is rejected with HTTP 400.</p><p><b>Example</b> — did-you-mean over the title column:</p><pre><code>\"suggest\": {\n  \"did_you_mean\": { \"text\": \"amiloid\", \"term\": { \"field\": \"title\" } }\n}</code></pre>"
 		},
 		"offset": {
 			"type": "integer",

@@ -39,6 +39,10 @@
 			"type": "string",
 			"description": "Opaque pagination cursor for the next page. When SearchQueryPart.HITS is requested and a full page (limit hits) was returned, this carries the cursor of the last returned hit; pass it back verbatim as the next request's searchAfter to continue. Null when there are no further pages (fewer than limit hits were returned)."
 		},
+		"suggestResults": {
+			"type": "string",
+			"description": "The raw OpenSearch suggester results as a JSON string (a map of suggestion name to its options), populated when the request supplied the opaque 'suggest' object. Returned as an opaque JSON string for the caller to parse."
+		},
 		"offset": {
 			"type": "integer",
 			"description": "Zero-based pagination offset echoed from the request. Always populated."

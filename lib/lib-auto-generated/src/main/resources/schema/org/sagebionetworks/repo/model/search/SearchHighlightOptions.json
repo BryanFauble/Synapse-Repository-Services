@@ -1,0 +1,28 @@
+{
+	"description": "Optional highlighting controls for a SearchQuery. When present (or when the boolean 'highlight' flag is true) each hit's field list includes HTML-tagged snippets showing where the query matched. These options refine the default highlighter: which columns to highlight, snippet sizing, and the surrounding tags.",
+	"properties": {
+		"fields": {
+			"type": "array",
+			"description": "Column names to highlight. Empty or null highlights every text-bearing column. Non-text columns named here are ignored.",
+			"items": {
+				"type": "string"
+			}
+		},
+		"fragmentSize": {
+			"type": "integer",
+			"description": "The maximum number of characters in each highlighted snippet. Maps to the OpenSearch 'fragment_size'. Defaults to the OpenSearch default (100) when omitted."
+		},
+		"numberOfFragments": {
+			"type": "integer",
+			"description": "The maximum number of snippets to return per field. Maps to the OpenSearch 'number_of_fragments'. Defaults to the OpenSearch default (5) when omitted."
+		},
+		"preTag": {
+			"type": "string",
+			"description": "The opening tag inserted before each matched term. Maps to the OpenSearch 'pre_tags'. Defaults to '<em>' when omitted."
+		},
+		"postTag": {
+			"type": "string",
+			"description": "The closing tag inserted after each matched term. Maps to the OpenSearch 'post_tags'. Defaults to '</em>' when omitted."
+		}
+	}
+}
