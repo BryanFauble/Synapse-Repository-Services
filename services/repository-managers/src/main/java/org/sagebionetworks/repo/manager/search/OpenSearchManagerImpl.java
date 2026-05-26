@@ -385,7 +385,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	private static String patchSemanticEnrichment(String typedRequestBody,
 			Map<String, String> enrichmentByColumnId) {
-		ObjectMapper jackson = new ObjectMapper();
+		ObjectMapper jackson = JSON_MAPPER;
 		ObjectNode root;
 		try {
 			root = (ObjectNode) jackson.readTree(typedRequestBody);
@@ -1417,6 +1417,13 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	// uses for analyzer settings.
 	private static final JsonpMapper QUERY_JSONP_MAPPER = new JacksonJsonpMapper();
 
+	// Shared Jackson mapper for the JSON assembly the typed OpenSearch / DTO layers don't cover:
+	// patching the create-index body, serializing aggregation / suggester results, and the
+	// search_after cursor. ObjectMapper is thread-safe once configured, so a single instance is
+	// reused rather than constructed per call. The opaque request-side parsing (query /
+	// aggregations / suggest inputs) goes through SearchOpaqueJsonUtil.parse instead.
+	private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
+
 	/**
 	 * Convert a caller-supplied opaque query-DSL object into a typed {@link Query}: normalize
 	 * the various JSON shapes to a {@link JsonNode}, enforce the clause allowlist (rejecting
@@ -1527,7 +1534,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	@SuppressWarnings("rawtypes")
 	static String serializeSuggest(Map<String, List<Suggest<Map>>> suggest) {
-		ObjectMapper jackson = new ObjectMapper();
+		ObjectMapper jackson = JSON_MAPPER;
 		ObjectNode root = jackson.createObjectNode();
 		for (Map.Entry<String, List<Suggest<Map>>> entry : suggest.entrySet()) {
 			ArrayNode array = jackson.createArrayNode();
@@ -1562,7 +1569,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 		JsonNode array;
 		try {
-			array = new ObjectMapper().readTree(cursor);
+			array = JSON_MAPPER.readTree(cursor);
 		} catch (IOException e) {
 			throw new IllegalArgumentException("searchAfter cursor is not valid JSON", e);
 		}
@@ -1595,7 +1602,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 	/** Serialize a hit's sort values into the opaque JSON-array cursor returned as nextSearchAfter. */
 	static String serializeCursor(List<FieldValue> sortValues) {
-		ArrayNode array = new ObjectMapper().createArrayNode();
+		ArrayNode array = JSON_MAPPER.createArrayNode();
 		for (FieldValue value : sortValues) {
 			if (value.isLong()) {
 				array.add(value.longValue());
@@ -1618,7 +1625,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 * OpenSearch JsonpMapper, then nested under its aggregation name.
 	 */
 	static String serializeAggregationResults(Map<String, Aggregate> aggregations) {
-		ObjectMapper jackson = new ObjectMapper();
+		ObjectMapper jackson = JSON_MAPPER;
 		ObjectNode root = jackson.createObjectNode();
 		for (Map.Entry<String, Aggregate> entry : aggregations.entrySet()) {
 			StringWriter writer = new StringWriter();
@@ -2020,7 +2027,6 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 * through {@code double}, silently truncating long ids past 2^53 — a real problem for
 	 * Synapse entity / file-handle ids, which sit comfortably above that bound.</p>
 	 */
-	private static final ObjectMapper FIELD_VALUE_MAPPER = new ObjectMapper();
 
 	static String convertFieldValue(Object value) {
 		if (value == null) {
@@ -2028,7 +2034,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 		if (value instanceof Collection || value instanceof Map) {
 			try {
-				return FIELD_VALUE_MAPPER.writeValueAsString(value);
+				return JSON_MAPPER.writeValueAsString(value);
 			} catch (JsonProcessingException e) {
 				throw new IllegalStateException(
 						"Failed to serialize search field value: " + value, e);
