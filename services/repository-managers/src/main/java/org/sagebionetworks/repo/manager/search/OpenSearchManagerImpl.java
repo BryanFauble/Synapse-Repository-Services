@@ -23,6 +23,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.client.json.JsonData;
+import org.opensearch.client.json.JsonpDeserializer;
+import org.opensearch.client.json.JsonpMapper;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch._types.*;
 import org.opensearch.client.opensearch._types.analysis.Analyzer;
@@ -37,10 +39,15 @@ import org.opensearch.client.opensearch.core.BulkRequest;
 import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.DeleteRequest;
 import org.opensearch.client.opensearch.core.IndexRequest;
+import org.opensearch.client.opensearch.core.SearchRequest;
 import org.opensearch.client.opensearch.core.SearchResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkOperation;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 import org.opensearch.client.opensearch.core.search.Hit;
+import org.opensearch.client.opensearch.generic.Bodies;
+import org.opensearch.client.opensearch.generic.Body;
+import org.opensearch.client.opensearch.generic.Requests;
+import org.opensearch.client.opensearch.generic.Response;
 import org.opensearch.client.opensearch.indices.AnalyzeRequest;
 import org.opensearch.client.opensearch.indices.CreateIndexRequest;
 import org.opensearch.client.opensearch.indices.CreateIndexResponse;
@@ -48,12 +55,15 @@ import org.opensearch.client.opensearch.indices.GetAliasResponse;
 import org.opensearch.client.opensearch.indices.GetMappingResponse;
 import org.opensearch.client.opensearch.indices.get_mapping.IndexMappingRecord;
 import org.opensearch.client.opensearch.indices.IndexSettingsAnalysis;
+import org.opensearch.client.opensearch.ingest.Processor;
+import org.sagebionetworks.repo.manager.search.SemanticEmbeddingBootstrapper.SemanticEmbeddingModel;
 import org.sagebionetworks.repo.model.search.SearchFieldValue;
 import org.sagebionetworks.repo.model.search.SearchHighlight;
 import org.sagebionetworks.repo.model.search.SearchHit;
 import org.sagebionetworks.repo.model.search.SearchAutocompleteBody;
 import org.sagebionetworks.repo.model.search.SearchQuery;
 import org.sagebionetworks.repo.model.search.SearchQueryPart;
+import org.sagebionetworks.repo.model.search.dsl.SearchPipeline;
 import org.sagebionetworks.repo.model.search.SearchQueryResults;
 import org.sagebionetworks.repo.model.search.table.ColumnAnalyzerOverride;
 import org.sagebionetworks.repo.model.search.table.ColumnAnalyzerOverrideEntry;
@@ -181,6 +191,32 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	static final String COLUMN_IDS_META_KEY = "columnIds";
 
+	/**
+	 * Mapping {@code _meta} key under which a physical index with a {@link #SEMANTIC_FIELD} stores the
+	 * {@link SemanticEmbeddingModel#spec()} its vectors were built with. Absent on an index without one.
+	 */
+	static final String SEMANTIC_SPEC_META_KEY = "semanticSpec";
+
+	/**
+	 * Dense-vector field holding one embedding per document, built from the columns flagged
+	 * {@code semantic}. Excluded from {@code _source}: a full embedding per hit would dominate the
+	 * response payload and mean nothing to a caller.
+	 */
+	static final String SEMANTIC_FIELD = "semantic_search";
+
+	/**
+	 * Transient document field carrying a row's joined semantic text. The index's ingestion pipeline
+	 * embeds it into {@link #SEMANTIC_FIELD} and then removes it, so it is never stored.
+	 */
+	static final String SEMANTIC_TEXT_FIELD = "semantic_search_text";
+
+	/**
+	 * faiss space for {@link #SEMANTIC_FIELD}. Bedrock returns unit-normalized vectors, so
+	 * {@code cosinesimil} orders like {@code innerproduct}, while keeping one score formula for both
+	 * the approximate search and the exact search faiss falls back to on a small pre-filtered set.
+	 */
+	private static final String SEMANTIC_SPACE_TYPE = "cosinesimil";
+
 	static final String SYSTEM_FIELD_ROW_ID = "_row_id";
 	private static final String SYSTEM_FIELD_ROW_VERSION = "_row_version";
 	// Prefix of the per-dependency row-level access-control fields (one per source benefactor column,
@@ -224,6 +260,15 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	 */
 	static final String DOT_ENCODING = "__dot__";
 
+	/**
+	 * The ingestion pipeline that embeds documents written into the physical index {@code indexName}.
+	 * One pipeline per physical slot, so a rebuild into the idle slot never rewrites the pipeline the
+	 * live slot was built with.
+	 */
+	static String embedPipelineName(String indexName) {
+		return indexName + "-embed";
+	}
+
 	static String toAossKey(String qualifiedName) {
 		return qualifiedName == null ? null : qualifiedName.replace(".", DOT_ENCODING);
 	}
@@ -237,6 +282,20 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	private static final int DEFAULT_LIMIT = 25;
 	private static final int MAX_LIMIT = 100;
 	private static final int AUTOCOMPLETE_MAX_LIMIT = 8;
+
+	@SuppressWarnings("rawtypes")
+	private static final JsonpDeserializer<SearchResponse<Map>> SEARCH_RESPONSE_DESERIALIZER =
+			SearchResponse.createSearchResponseDeserializer(JsonpDeserializer.of(Map.class));
+
+	/**
+	 * Query parameters of the {@code _search} request. The typed search endpoint adds these itself;
+	 * a request posted through the generic client must restate them. {@code typed_keys} makes
+	 * OpenSearch key each aggregation as {@code type#name}, the only form
+	 * {@link #SEARCH_RESPONSE_DESERIALIZER} can read.
+	 */
+	static final Map<String, String> SEARCH_QUERY_PARAMETERS = Map.of(
+			"typed_keys", "true",
+			"cancel_after_time_interval", "60s");
 
 	private final OpenSearchClient openSearchClient;
 
@@ -259,7 +318,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 			List<ColumnAnalyzerOverride> columnAnalyzerOverrides,
 			Map<String, IndexSettingsAnalysis> resolvedAnalyzers,
 			List<String> benefactorColumnNames, int numberOfShards, int numberOfReplicas,
-			IndexAuthorizationSnapshot snapshot) {
+			IndexAuthorizationSnapshot snapshot, SemanticEmbeddingModel semanticModel) {
 		ValidateArgument.required(resolvedAnalyzers, "resolvedAnalyzers");
 		ValidateArgument.required(snapshot, "snapshot");
 		String snapshotJson;
@@ -275,24 +334,46 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 
 		CreateIndexRequest request = CreateIndexRequest.of(req -> req
 				.index(indexName)
-				.settings(s -> s
-					.numberOfShards(numberOfShards)
-					.numberOfReplicas(numberOfReplicas)
-					.analysis(a -> {
-						buildAnalysisSettings(a, resolvedAnalyzers, defaultAnalyzer);
-						return a;
-					}))
+				.settings(s -> {
+					s.numberOfShards(numberOfShards)
+						.numberOfReplicas(numberOfReplicas)
+						.analysis(a -> {
+							buildAnalysisSettings(a, resolvedAnalyzers, defaultAnalyzer);
+							return a;
+						});
+					if (semanticModel != null) {
+						// knn enables the k-NN plugin on the index, which a knn_vector property requires.
+						s.knn(true).defaultPipeline(embedPipelineName(indexName));
+					}
+					return s;
+				})
 				.mappings(m -> {
 					buildMappings(m, columns, defaultAnalyzer,
 							overrideMap, resolvedAnalyzers, benefactorColumnNames);
 					m.meta(AUTHORIZATION_SNAPSHOT_META_KEY, JsonData.of(snapshotJson));
 					m.meta(COLUMN_IDS_META_KEY, JsonData.of(
 							columns.stream().map(ColumnModel::getId).collect(Collectors.joining(","))));
+					if (semanticModel != null) {
+						m.properties(SEMANTIC_FIELD, p -> p.knnVector(kv -> kv
+								.dimension(semanticModel.dimension())
+								.method(method -> method
+										.name("hnsw")
+										.engine("faiss")
+										.spaceType(SEMANTIC_SPACE_TYPE))));
+						m.source(sf -> sf.excludes(List.of(SEMANTIC_FIELD)));
+						m.meta(SEMANTIC_SPEC_META_KEY, JsonData.of(semanticModel.spec()));
+					}
 					return m;
 				})
 		);
 
 		String appliedConfigJson = request.toJsonString();
+
+		// The pipeline must exist before the index that names it as its default pipeline, or the
+		// index's first write is rejected.
+		if (semanticModel != null) {
+			putEmbedPipeline(indexName, semanticModel.modelId());
+		}
 
 		try {
 			return TimeUtils.waitForExponentialMaxRetry(CREATE_INDEX_MAX_RETRIES,
@@ -560,8 +641,58 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		return resolved != null && resolved.analyzer().containsKey(DEFAULT_SEARCH_ANALYZER_NAME);
 	}
 
+	/**
+	 * Create (or overwrite) the ingestion pipeline that embeds every document written to one physical
+	 * index: a {@code text_embedding} processor turns {@link #SEMANTIC_TEXT_FIELD} into
+	 * {@link #SEMANTIC_FIELD}, then a {@code remove} drops the text so it never reaches
+	 * {@code _source}. A row with no semantic text carries neither field, so both processors tolerate
+	 * its absence.
+	 */
+	private void putEmbedPipeline(String indexName, String modelId) {
+		String pipelineName = embedPipelineName(indexName);
+		try {
+			openSearchClient.ingest().putPipeline(req -> req
+					.id(pipelineName)
+					.description("Embeds the semantic text of documents written to " + indexName)
+					.processors(
+							Processor.of(p -> p.textEmbedding(te -> te
+									.modelId(modelId)
+									.fieldMap(SEMANTIC_TEXT_FIELD, SEMANTIC_FIELD))),
+							Processor.of(p -> p.remove(r -> r
+									.field(SEMANTIC_TEXT_FIELD)
+									.ignoreMissing(true)))));
+		} catch (OpenSearchException e) {
+			throw new RuntimeException("Failed to create ingestion pipeline: " + pipelineName
+					+ " (" + describeError(e.error()) + ")", e);
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to create ingestion pipeline: " + pipelineName, e);
+		}
+	}
+
 	@Override
 	public void deleteIndex(String indexName) {
+		deletePhysicalIndex(indexName);
+		deleteEmbedPipeline(indexName);
+	}
+
+	/**
+	 * Best-effort: an index built without semantic columns never had a pipeline, and a pipeline left
+	 * behind is inert once its index is gone and is overwritten by the next build into the slot.
+	 */
+	private void deleteEmbedPipeline(String indexName) {
+		String pipelineName = embedPipelineName(indexName);
+		try {
+			openSearchClient.ingest().deletePipeline(req -> req.id(pipelineName));
+		} catch (OpenSearchException e) {
+			if (!Integer.valueOf(404).equals(e.status())) {
+				LOG.warn("Failed to delete ingestion pipeline {} ({})", pipelineName, describeError(e.error()));
+			}
+		} catch (IOException e) {
+			LOG.warn("Failed to delete ingestion pipeline {} ({})", pipelineName, e.getMessage());
+		}
+	}
+
+	private void deletePhysicalIndex(String indexName) {
 		try {
 			TimeUtils.waitForExponentialMaxRetry(DELETE_INDEX_MAX_RETRIES,
 					DELETE_INDEX_INITIAL_BACKOFF_MS, () -> {
@@ -691,6 +822,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 		JsonData snapshotValue = mapping.mappings().meta().get(AUTHORIZATION_SNAPSHOT_META_KEY);
 		JsonData columnIdsValue = mapping.mappings().meta().get(COLUMN_IDS_META_KEY);
+		JsonData semanticSpecValue = mapping.mappings().meta().get(SEMANTIC_SPEC_META_KEY);
 		if (snapshotValue == null || columnIdsValue == null) {
 			return Optional.empty();
 		}
@@ -704,7 +836,8 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}
 		String joinedColumnIds = columnIdsValue.to(String.class);
 		List<String> columnIds = joinedColumnIds.isEmpty() ? List.of() : Arrays.asList(joinedColumnIds.split(","));
-		return Optional.of(new LiveIndex(physicalIndex, snapshot, columnIds));
+		String semanticSpec = semanticSpecValue == null ? null : semanticSpecValue.to(String.class);
+		return Optional.of(new LiveIndex(physicalIndex, snapshot, columnIds, semanticSpec));
 	}
 
 	@Override
@@ -1214,8 +1347,9 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	@Override
 	public SearchQueryResults search(String indexName, SearchQuery body, List<ColumnModel> columns,
 			Set<SearchQueryPart> options,
-			List<Query> accessFilters) {
-		return executeSearch(indexName, body, columns, options, DEFAULT_LIMIT, MAX_LIMIT, false, accessFilters);
+			List<Query> accessFilters, String semanticModelId, SearchPipeline savedPipeline) {
+		return executeSearch(indexName, body, columns, options, DEFAULT_LIMIT, MAX_LIMIT, false, accessFilters,
+				semanticModelId, savedPipeline);
 	}
 
 	@Override
@@ -1225,7 +1359,7 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		// Autocomplete does not accept a caller-supplied size; force the server cap as both
 		// default and ceiling.
 		return executeSearch(indexName, body, columns, options,
-				AUTOCOMPLETE_MAX_LIMIT, AUTOCOMPLETE_MAX_LIMIT, true, accessFilters);
+				AUTOCOMPLETE_MAX_LIMIT, AUTOCOMPLETE_MAX_LIMIT, true, accessFilters, null, null);
 	}
 
 	// ---- Private helpers ----
@@ -1257,37 +1391,88 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 	@SuppressWarnings("rawtypes")
 	SearchQueryResults executeSearch(String indexName, Object body, List<ColumnModel> columns,
 			Set<SearchQueryPart> options, int defaultSize, int maxSize, boolean autocomplete,
-			List<Query> accessFilters) {
+			List<Query> accessFilters, String semanticModelId, SearchPipeline savedPipeline) {
 		Map<String, String> idToName = columns.stream()
 				.collect(Collectors.toMap(ColumnModel::getId, ColumnModel::getName, (a2, b) -> a2));
 		SearchFieldRewriter.RoutingContext ctx = routingContextFor(columns);
-		// One-element holder: the request builder lambda can't return a value, so
-		// applyBodyToRequest reports the resolved `from` through this slot.
-		int[] effectiveFrom = new int[1];
-		try {
-			SearchResponse<Map> response = openSearchClient.search(req -> {
-				req.index(indexName);
+		SearchRequest.Builder req = new SearchRequest.Builder()
+				.index(indexName)
 				// Timeout defines when incomplete results should be returned, giving
-				// a 10s grace period before requests are canceled.
-				req.timeout("50s");
-				req.cancelAfterTimeInterval(t -> t.time("60s"));
-				effectiveFrom[0] = autocomplete
-						? SearchOpaqueJsonUtil.applyAutocompleteBodyToRequest(
-								body, ctx, req, options, defaultSize, accessFilters)
-						: SearchOpaqueJsonUtil.applyBodyToRequest(
-								body, ctx, req, options, defaultSize, maxSize, accessFilters);
-				return req;
-			}, Map.class);
-			return convertResponse(response, indexName, effectiveFrom[0], idToName, options);
+				// a 10s grace period before requests are canceled (cancel_after_time_interval).
+				.timeout("50s");
+		SearchOpaqueJsonUtil.AppliedBody applied = autocomplete
+				? new SearchOpaqueJsonUtil.AppliedBody(SearchOpaqueJsonUtil.applyAutocompleteBodyToRequest(
+						body, ctx, req, options, defaultSize, accessFilters), null, null)
+				: SearchOpaqueJsonUtil.applyBodyToRequest(
+						body, ctx, req, options, defaultSize, maxSize, accessFilters, semanticModelId, savedPipeline);
+		JsonpMapper mapper = openSearchClient._transport().jsonpMapper();
+		try (Response response = openSearchClient.generic().execute(Requests.builder()
+				.method("POST")
+				.endpoint("/" + indexName + "/_search")
+				.query(SEARCH_QUERY_PARAMETERS)
+				.json(searchRequestBody(req.build(), applied))
+				.build())) {
+			if (response.getStatus() >= 400) {
+				throw new OpenSearchException(readErrorResponse(response, mapper));
+			}
+			SearchResponse<Map> searchResponse = Bodies.json(response.getBody().orElseThrow(),
+					SEARCH_RESPONSE_DESERIALIZER, mapper);
+			return convertResponse(searchResponse, indexName, applied.from(), idToName, options);
 		} catch (OpenSearchException e) {
 			if (INDEX_NOT_FOUND_EXCEPTION.equals(e.error().type())) {
 				throw new IllegalStateException("Search index is still building. Please try again later.", e);
+			}
+			// The validator cannot anticipate every rejection (e.g. a field type mismatch);
+			// OpenSearch's message is the more specific one for the caller.
+			if (e.status() == 400) {
+				throw new IllegalArgumentException(describeError(e.error()), e);
 			}
 			throw new RuntimeException("Failed to execute search on search index: " + indexName
 					+ " (" + describeError(e.error()) + ")", e);
 		} catch (IOException e) {
 			throw new RuntimeException("Failed to execute search on search index: " + indexName, e);
 		}
+	}
+
+	/**
+	 * The JSON body of a search request. The typed client has no {@code search_pipeline} body key
+	 * and no {@code hybrid.min_score}, so both are spliced into the serialized request.
+	 */
+	static String searchRequestBody(SearchRequest request, SearchOpaqueJsonUtil.AppliedBody applied) {
+		String json = request.toJsonString();
+		if (applied.searchPipeline() == null && applied.hybridMinScore() == null) {
+			return json;
+		}
+		try {
+			ObjectNode root = (ObjectNode) FIELD_VALUE_MAPPER.readTree(json);
+			if (applied.searchPipeline() != null) {
+				root.set("search_pipeline", applied.searchPipeline());
+			}
+			if (applied.hybridMinScore() != null) {
+				((ObjectNode) root.get("query").get("hybrid")).set("min_score", applied.hybridMinScore());
+			}
+			return FIELD_VALUE_MAPPER.writeValueAsString(root);
+		} catch (JsonProcessingException e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	/**
+	 * The {@link ErrorResponse} of a failed generic-client request. A missing or unparseable body
+	 * (e.g. an HTML gateway page) yields the same {@code http_exception} the typed transport reports.
+	 */
+	private static ErrorResponse readErrorResponse(Response response, JsonpMapper mapper) {
+		Optional<Body> body = response.getBody();
+		if (body.isPresent()) {
+			try {
+				return Bodies.json(body.get(), ErrorResponse._DESERIALIZER, mapper);
+			} catch (RuntimeException unparseable) {
+				// fall through to the generic error
+			}
+		}
+		int status = response.getStatus();
+		return ErrorResponse.of(err -> err.status(status)
+				.error(cause -> cause.type("http_exception").reason("server returned " + status)));
 	}
 
 	@SuppressWarnings({"rawtypes", "unchecked"})
@@ -1474,7 +1659,21 @@ public class OpenSearchManagerImpl implements OpenSearchManager {
 		}));
 	}
 
-	Map<String, ColumnAnalyzerOverrideEntry> buildOverrideMap(
+	/**
+	 * The ids of the columns flagged {@code semantic}, resolved with the same first-bundle-wins rule
+	 * {@link #createIndex} uses to pick each column's override entry.
+	 */
+	static Set<String> resolveSemanticColumnIds(List<ColumnModel> columns,
+			List<ColumnAnalyzerOverride> overrides) {
+		Map<String, String> nameToId = columns.stream()
+				.collect(Collectors.toMap(ColumnModel::getName, ColumnModel::getId, (a, b) -> a));
+		return buildOverrideMap(overrides, nameToId).entrySet().stream()
+				.filter(e -> Boolean.TRUE.equals(e.getValue().getSemantic()))
+				.map(Map.Entry::getKey)
+				.collect(Collectors.toSet());
+	}
+
+	static Map<String, ColumnAnalyzerOverrideEntry> buildOverrideMap(
 			List<ColumnAnalyzerOverride> columnAnalyzerOverrides, Map<String, String> nameToId) {
 		Map<String, ColumnAnalyzerOverrideEntry> map = new HashMap<>();
 		if (columnAnalyzerOverrides == null) {
